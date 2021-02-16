@@ -18,16 +18,18 @@ import './recorder.css';
 import * as React from 'react';
 import { Toolbar } from '../components/toolbar';
 import { ToolbarButton } from '../components/toolbarButton';
-import { Source } from '../components/source';
-
-type Mode = 'inspecting' | 'recording' | 'none';
+import { Source as SourceView } from '../components/source';
+import type { CallLog, Mode, Source } from '../../server/supplements/recorder/recorderTypes';
+import { SplitView } from '../components/splitView';
 
 declare global {
   interface Window {
     playwrightSetMode: (mode: Mode) => void;
     playwrightSetPaused: (paused: boolean) => void;
-    playwrightSetSource: (params: { text: string, language: string }) => void;
+    playwrightSetSources: (sources: Source[]) => void;
+    playwrightUpdateLogs: (callLogs: CallLog[]) => void;
     dispatch(data: any): Promise<void>;
+    playwrightSourceEchoForTest: string;
   }
 }
 
@@ -36,38 +38,86 @@ export interface RecorderProps {
 
 export const Recorder: React.FC<RecorderProps> = ({
 }) => {
-  const [source, setSource] = React.useState({ language: 'javascript', text: '' });
+  const [source, setSource] = React.useState<Source>({ file: '', language: 'javascript', text: '', highlight: [] });
   const [paused, setPaused] = React.useState(false);
+  const [log, setLog] = React.useState(new Map<number, CallLog>());
   const [mode, setMode] = React.useState<Mode>('none');
 
   window.playwrightSetMode = setMode;
-  window.playwrightSetSource = setSource;
+  window.playwrightSetSources = sources => {
+    let s = sources.find(s => s.revealLine);
+    if (!s)
+      s = sources.find(s => s.file === source.file);
+    if (!s)
+      s = sources[0];
+    setSource(s);
+  };
   window.playwrightSetPaused = setPaused;
+  window.playwrightUpdateLogs = callLogs => {
+    const newLog = new Map<number, CallLog>(log);
+    for (const callLog of callLogs)
+      newLog.set(callLog.id, callLog);
+    setLog(newLog);
+  };
 
-  return <div className="recorder">
+  window.playwrightSourceEchoForTest = source.text;
+
+  const messagesEndRef = React.createRef<HTMLDivElement>();
+  React.useLayoutEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ block: 'center', inline: 'nearest' });
+  }, [messagesEndRef]);
+  
+  return <div className='recorder'>
     <Toolbar>
-      <ToolbarButton icon="record" title="Record" toggled={mode == 'recording'} onClick={() => {
+      <ToolbarButton icon='record' title='Record' toggled={mode == 'recording'} onClick={() => {
         window.dispatch({ event: 'setMode', params: { mode: mode === 'recording' ? 'none' : 'recording' }}).catch(() => { });
       }}></ToolbarButton>
-      <ToolbarButton icon="question" title="Inspect" toggled={mode == 'inspecting'} onClick={() => {
+      <ToolbarButton icon='question' title='Inspect' toggled={mode == 'inspecting'} onClick={() => {
         window.dispatch({ event: 'setMode', params: { mode: mode === 'inspecting' ? 'none' : 'inspecting' }}).catch(() => { });
       }}></ToolbarButton>
-      <ToolbarButton icon="files" title="Copy" disabled={!source.text} onClick={() => {
+      <ToolbarButton icon='files' title='Copy' disabled={!source.text} onClick={() => {
         copy(source.text);
       }}></ToolbarButton>
-      <div style={{flex: "auto"}}></div>
-      <ToolbarButton icon="clear-all" title="Clear" disabled={!source.text} onClick={() => {
+      <ToolbarButton icon='debug-continue' title='Resume' disabled={!paused} onClick={() => {
+        setPaused(false);
+        window.dispatch({ event: 'resume' }).catch(() => {});
+      }}></ToolbarButton>
+      <ToolbarButton icon='debug-pause' title='Pause' disabled={paused} onClick={() => {
+        window.dispatch({ event: 'pause' }).catch(() => {});
+      }}></ToolbarButton>
+      <ToolbarButton icon='debug-step-over' title='Step over' disabled={!paused} onClick={() => {
+        setPaused(false);
+        window.dispatch({ event: 'step' }).catch(() => {});
+      }}></ToolbarButton>
+      <div style={{flex: 'auto'}}></div>
+      <ToolbarButton icon='clear-all' title='Clear' disabled={!source.text} onClick={() => {
         window.dispatch({ event: 'clear' }).catch(() => {});
       }}></ToolbarButton>
     </Toolbar>
-    <div className="recorder-paused-infobar" hidden={!paused}>
-      <ToolbarButton icon="run" title="Resume" disabled={!paused} onClick={() => {
-        window.dispatch({ event: 'resume' }).catch(() => {});
-      }}></ToolbarButton>
-      <span style={{paddingLeft: 10}}>Paused due to <span className="code">page.pause()</span></span>
-      <div style={{flex: "auto"}}></div>
-    </div>
-    <Source text={source.text} language={source.language}></Source>
+    <SplitView sidebarSize={200}>
+      <SourceView text={source.text} language={source.language} highlight={source.highlight} revealLine={source.revealLine}></SourceView>
+      <div className='vbox'>
+        <div className='recorder-log-header' style={{flex: 'none'}}>Log</div>
+        <div className='recorder-log' style={{flex: 'auto'}}>
+          {[...log.values()].map(callLog => {
+            return <div className={`recorder-log-call ${callLog.status}`} key={callLog.id}>
+              <div className='recorder-log-call-header'>
+                <span className={'codicon ' + iconClass(callLog)}></span>{ callLog.title }
+              </div>
+              { callLog.messages.map((message, i) => {
+                return <div className='recorder-log-message' key={i}>
+                  { message.trim() }
+                </div>;
+              })}
+              { callLog.error ? <div className='recorder-log-message error'>
+                { callLog.error }
+              </div> : undefined }
+            </div>
+          })}
+          <div ref={messagesEndRef}></div>
+        </div>
+      </div>
+    </SplitView>
   </div>;
 };
 
@@ -80,4 +130,13 @@ function copy(text: string) {
   textArea.select();
   document.execCommand('copy');
   textArea.remove();
+}
+
+function iconClass(callLog: CallLog): string {
+  switch (callLog.status) {
+    case 'done': return 'codicon-check';
+    case 'in-progress': return 'codicon-clock';
+    case 'paused': return 'codicon-debug-pause';
+    case 'error': return 'codicon-error';
+  }
 }

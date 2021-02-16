@@ -45,6 +45,7 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
   private _cacheQuerySimple: QueryCache = new Map();
   _cacheText = new Map<Element | ShadowRoot, string>();
   private _scoreMap: Map<Element, number> | undefined;
+  private _retainCacheCounter = 0;
 
   constructor(extraEngines: Map<string, SelectorEngine>) {
     for (const [name, engine] of extraEngines)
@@ -75,16 +76,23 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
       throw new Error(`Please keep customCSSNames in sync with evaluator engines`);
   }
 
-  clearCaches() {
-    this._cacheQueryCSS.clear();
-    this._cacheMatches.clear();
-    this._cacheQuery.clear();
-    this._cacheMatchesSimple.clear();
-    this._cacheMatchesParents.clear();
-    this._cacheCallMatches.clear();
-    this._cacheCallQuery.clear();
-    this._cacheQuerySimple.clear();
-    this._cacheText.clear();
+  begin() {
+    ++this._retainCacheCounter;
+  }
+
+  end() {
+    --this._retainCacheCounter;
+    if (!this._retainCacheCounter) {
+      this._cacheQueryCSS.clear();
+      this._cacheMatches.clear();
+      this._cacheQuery.clear();
+      this._cacheMatchesSimple.clear();
+      this._cacheMatchesParents.clear();
+      this._cacheCallMatches.clear();
+      this._cacheCallQuery.clear();
+      this._cacheQuerySimple.clear();
+      this._cacheText.clear();
+    }
   }
 
   private _cached<T>(cache: QueryCache, main: any, rest: any[], cb: () => T): T {
@@ -109,43 +117,53 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
 
   matches(element: Element, s: Selector, context: QueryContext): boolean {
     const selector = this._checkSelector(s);
-    return this._cached<boolean>(this._cacheMatches, element, [selector, context], () => {
-      if (Array.isArray(selector))
-        return this._matchesEngine(isEngine, element, selector, context);
-      if (!this._matchesSimple(element, selector.simples[selector.simples.length - 1].selector, context))
-        return false;
-      return this._matchesParents(element, selector, selector.simples.length - 2, context);
-    });
+    this.begin();
+    try {
+      return this._cached<boolean>(this._cacheMatches, element, [selector, context.scope, context.pierceShadow], () => {
+        if (Array.isArray(selector))
+          return this._matchesEngine(isEngine, element, selector, context);
+        if (!this._matchesSimple(element, selector.simples[selector.simples.length - 1].selector, context))
+          return false;
+        return this._matchesParents(element, selector, selector.simples.length - 2, context);
+      });
+    } finally {
+      this.end();
+    }
   }
 
   query(context: QueryContext, s: any): Element[] {
     const selector = this._checkSelector(s);
-    return this._cached<Element[]>(this._cacheQuery, selector, [context], () => {
-      if (Array.isArray(selector))
-        return this._queryEngine(isEngine, context, selector);
+    this.begin();
+    try {
+      return this._cached<Element[]>(this._cacheQuery, selector, [context.scope, context.pierceShadow], () => {
+        if (Array.isArray(selector))
+          return this._queryEngine(isEngine, context, selector);
 
-      // query() recursively calls itself, so we set up a new map for this particular query() call.
-      const previousScoreMap = this._scoreMap;
-      this._scoreMap = new Map();
-      let elements = this._querySimple(context, selector.simples[selector.simples.length - 1].selector);
-      elements = elements.filter(element => this._matchesParents(element, selector, selector.simples.length - 2, context));
-      if (this._scoreMap.size) {
-        elements.sort((a, b) => {
-          const aScore = this._scoreMap!.get(a);
-          const bScore = this._scoreMap!.get(b);
-          if (aScore === bScore)
-            return 0;
-          if (aScore === undefined)
-            return 1;
-          if (bScore === undefined)
-            return -1;
-          return aScore - bScore;
-        });
-      }
-      this._scoreMap = previousScoreMap;
+        // query() recursively calls itself, so we set up a new map for this particular query() call.
+        const previousScoreMap = this._scoreMap;
+        this._scoreMap = new Map();
+        let elements = this._querySimple(context, selector.simples[selector.simples.length - 1].selector);
+        elements = elements.filter(element => this._matchesParents(element, selector, selector.simples.length - 2, context));
+        if (this._scoreMap.size) {
+          elements.sort((a, b) => {
+            const aScore = this._scoreMap!.get(a);
+            const bScore = this._scoreMap!.get(b);
+            if (aScore === bScore)
+              return 0;
+            if (aScore === undefined)
+              return 1;
+            if (bScore === undefined)
+              return -1;
+            return aScore - bScore;
+          });
+        }
+        this._scoreMap = previousScoreMap;
 
-      return elements;
-    });
+        return elements;
+      });
+    } finally {
+      this.end();
+    }
   }
 
   _markScore(element: Element, score: number) {
@@ -156,7 +174,7 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
   }
 
   private _matchesSimple(element: Element, simple: CSSSimpleSelector, context: QueryContext): boolean {
-    return this._cached<boolean>(this._cacheMatchesSimple, element, [simple, context], () => {
+    return this._cached<boolean>(this._cacheMatchesSimple, element, [simple, context.scope, context.pierceShadow], () => {
       const isPossiblyScopeClause = simple.functions.some(f => f.name === 'scope' || f.name === 'is');
       if (!isPossiblyScopeClause && element === context.scope)
         return false;
@@ -174,7 +192,7 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
     if (!simple.functions.length)
       return this._queryCSS(context, simple.css || '*');
 
-    return this._cached<Element[]>(this._cacheQuerySimple, simple, [context], () => {
+    return this._cached<Element[]>(this._cacheQuerySimple, simple, [context.scope, context.pierceShadow], () => {
       let css = simple.css;
       const funcs = simple.functions;
       if (css === '*' && funcs.length)
@@ -211,7 +229,7 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
   private _matchesParents(element: Element, complex: CSSComplexSelector, index: number, context: QueryContext): boolean {
     if (index < 0)
       return true;
-    return this._cached<boolean>(this._cacheMatchesParents, element, [complex, index, context], () => {
+    return this._cached<boolean>(this._cacheMatchesParents, element, [complex, index, context.scope, context.pierceShadow], () => {
       const { selector: simple, combinator } = complex.simples[index];
       if (combinator === '>') {
         const parent = parentElementOrShadowHostInContext(element, context);
@@ -285,13 +303,13 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
   }
 
   private _callMatches(engine: SelectorEngine, element: Element, args: CSSFunctionArgument[], context: QueryContext): boolean {
-    return this._cached<boolean>(this._cacheCallMatches, element, [engine, args, context.scope, context.pierceShadow], () => {
+    return this._cached<boolean>(this._cacheCallMatches, element, [engine, context.scope, context.pierceShadow, ...args], () => {
       return engine.matches!(element, args, context, this);
     });
   }
 
   private _callQuery(engine: SelectorEngine, args: CSSFunctionArgument[], context: QueryContext): Element[] {
-    return this._cached<Element[]>(this._cacheCallQuery, args, [engine, context.scope, context.pierceShadow], () => {
+    return this._cached<Element[]>(this._cacheCallQuery, engine, [context.scope, context.pierceShadow, ...args], () => {
       return engine.query!(context, args, this);
     });
   }
@@ -301,7 +319,7 @@ export class SelectorEvaluatorImpl implements SelectorEvaluator {
   }
 
   _queryCSS(context: QueryContext, css: string): Element[] {
-    return this._cached<Element[]>(this._cacheQueryCSS, css, [context], () => {
+    return this._cached<Element[]>(this._cacheQueryCSS, css, [context.scope, context.pierceShadow], () => {
       let result: Element[] = [];
       function query(root: Element | ShadowRoot | Document) {
         result = result.concat([...root.querySelectorAll(css)]);
@@ -410,7 +428,7 @@ const textEngine: SelectorEngine = {
     if (args.length !== 1 || typeof args[0] !== 'string')
       throw new Error(`"text" engine expects a single string`);
     const matcher = textMatcher(args[0], true);
-    return elementMatchesText(evaluator as SelectorEvaluatorImpl, element, matcher);
+    return elementMatchesText(evaluator as SelectorEvaluatorImpl, element, matcher) === 'self';
   },
 };
 
@@ -419,7 +437,7 @@ const textIsEngine: SelectorEngine = {
     if (args.length !== 1 || typeof args[0] !== 'string')
       throw new Error(`"text-is" engine expects a single string`);
     const matcher = textMatcher(args[0], false);
-    return elementMatchesText(evaluator as SelectorEvaluatorImpl, element, matcher);
+    return elementMatchesText(evaluator as SelectorEvaluatorImpl, element, matcher) === 'self';
   },
 };
 
@@ -429,7 +447,7 @@ const textMatchesEngine: SelectorEngine = {
       throw new Error(`"text-matches" engine expects a regexp body and optional regexp flags`);
     const re = new RegExp(args[0], args.length === 2 ? args[1] : undefined);
     const matcher = (s: string) => re.test(s);
-    return elementMatchesText(evaluator as SelectorEvaluatorImpl, element, matcher);
+    return elementMatchesText(evaluator as SelectorEvaluatorImpl, element, matcher) === 'self';
   },
 };
 
@@ -458,7 +476,7 @@ function shouldSkipForTextMatching(element: Element | ShadowRoot) {
   return element.nodeName === 'SCRIPT' || element.nodeName === 'STYLE' || document.head && document.head.contains(element);
 }
 
-function elementText(evaluator: SelectorEvaluatorImpl, root: Element | ShadowRoot): string {
+export function elementText(evaluator: SelectorEvaluatorImpl, root: Element | ShadowRoot): string {
   let value = evaluator._cacheText.get(root);
   if (value === undefined) {
     value = '';
@@ -481,18 +499,18 @@ function elementText(evaluator: SelectorEvaluatorImpl, root: Element | ShadowRoo
   return value;
 }
 
-export function elementMatchesText(evaluator: SelectorEvaluatorImpl, element: Element, matcher: (s: string) => boolean): boolean {
+export function elementMatchesText(evaluator: SelectorEvaluatorImpl, element: Element, matcher: (s: string) => boolean): 'none' | 'self' | 'selfAndChildren' {
   if (shouldSkipForTextMatching(element))
-    return false;
+    return 'none';
   if (!matcher(elementText(evaluator, element)))
-    return false;
+    return 'none';
   for (let child = element.firstChild; child; child = child.nextSibling) {
     if (child.nodeType === Node.ELEMENT_NODE && matcher(elementText(evaluator, child as Element)))
-      return false;
+      return 'selfAndChildren';
   }
   if (element.shadowRoot  && matcher(elementText(evaluator, element.shadowRoot)))
-    return false;
-  return true;
+    return 'selfAndChildren';
+  return 'self';
 }
 
 function boxRightOf(box1: DOMRect, box2: DOMRect): number | undefined {

@@ -27,7 +27,7 @@ import { Protocol } from './protocol';
 import { toConsoleMessageLocation, exceptionToError, releaseObject } from './crProtocolHelper';
 import * as dialog from '../dialog';
 import { PageDelegate } from '../page';
-import * as path from 'path';
+import path from 'path';
 import { RawMouseImpl, RawKeyboardImpl, RawTouchscreenImpl } from './crInput';
 import { getAccessibilityTree } from './crAccessibility';
 import { CRCoverage } from './crCoverage';
@@ -639,7 +639,7 @@ class FrameSession {
     }
 
     const url = event.targetInfo.url;
-    const worker = new Worker(url);
+    const worker = new Worker(this._page, url);
     this._page._addWorker(event.sessionId, worker);
     session.once('Runtime.executionContextCreated', async event => {
       worker._createExecutionContext(new CRExecutionContext(session, event.context));
@@ -811,10 +811,10 @@ class FrameSession {
 
   async _startScreencast(screencastId: string, options: types.PageScreencastOptions): Promise<void> {
     assert(!this._screencastId);
-    const ffmpegPath = this._crPage._browserContext._browser._ffmpegPath;
+    const ffmpegPath = this._crPage._browserContext._browser.options.registry.executablePath('ffmpeg');
     if (!ffmpegPath)
       throw new Error('ffmpeg executable was not found');
-    this._videoRecorder = await VideoRecorder.launch(ffmpegPath, options);
+    this._videoRecorder = await VideoRecorder.launch(this._crPage._page, ffmpegPath, options);
     this._screencastId = screencastId;
     const gotFirstFrame = new Promise(f => this._client.once('Page.screencastFrame', f));
     await this._client.send('Page.startScreencast', {

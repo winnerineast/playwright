@@ -13,11 +13,19 @@ Fired when the websocket closes.
 
 Fired when the websocket recieves a frame.
 
+## event: WebSocket.frameReceived
+* langs: csharp, java
+- type: <[WebSocketFrame]>
+
 ## event: WebSocket.frameSent
 - type: <[Object]>
   - `payload` <[string]|[Buffer]> frame payload
 
 Fired when the websocket sends a frame.
+
+## event: WebSocket.frameSent
+* langs: csharp, java
+- type: <[WebSocketFrame]>
 
 ## event: WebSocket.socketError
 - type: <[String]>
@@ -64,7 +72,7 @@ Performs action and waits for a frame to be sent. If predicate is provided, it p
 Will throw an error if the WebSocket or Page is closed before the frame is received.
 
 ### option: WebSocket.waitForFrameReceived.predicate
-- `predicate` <[function]\([WebSocketFrame]\):[bool]>
+- `predicate` <[function]\([WebSocketFrame]\):[boolean]>
 
 Receives the [WebSocketFrame] object and resolves to truthy value when the waiting should resolve.
 
@@ -79,7 +87,7 @@ Performs action and waits for a frame to be sent. If predicate is provided, it p
 Will throw an error if the WebSocket or Page is closed before the frame is sent.
 
 ### option: WebSocket.waitForFrameSent.predicate
-- `predicate` <[function]\([WebSocketFrame]\):[bool]>
+- `predicate` <[function]\([WebSocketFrame]\):[boolean]>
 
 Receives the [WebSocketFrame] object and resolves to truthy value when the waiting should resolve.
 

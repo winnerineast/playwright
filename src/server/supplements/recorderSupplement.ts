@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import * as fs from 'fs';
 import * as actions from './recorder/recorderActions';
 import type * as channels from '../../protocol/channels';
 import { CodeGenerator, ActionInContext } from './recorder/codeGenerator';
@@ -25,11 +26,14 @@ import { LanguageGenerator } from './recorder/language';
 import { JavaScriptLanguageGenerator } from './recorder/javascript';
 import { CSharpLanguageGenerator } from './recorder/csharp';
 import { PythonLanguageGenerator } from './recorder/python';
-import { ProgressController } from '../progress';
 import * as recorderSource from '../../generated/recorderSource';
 import * as consoleApiSource from '../../generated/consoleApiSource';
-import { BufferedOutput, FileOutput, FlushingTerminalOutput, OutputMultiplexer, RecorderOutput, TerminalOutput, Writable } from './recorder/outputs';
-import { EventData, Mode, RecorderApp } from './recorder/recorderApp';
+import { BufferedOutput, FileOutput, OutputMultiplexer, RecorderOutput } from './recorder/outputs';
+import { RecorderApp } from './recorder/recorderApp';
+import { CallMetadata, internalCallMetadata, SdkObject } from '../instrumentation';
+import { Point } from '../../common/types';
+import { CallLog, EventData, Mode, Source, UIState } from './recorder/recorderTypes';
+import { isUnderTest } from '../../utils/utils';
 
 type BindingSource = { frame: Frame, page: Page };
 
@@ -42,16 +46,18 @@ export class RecorderSupplement {
   private _lastDialogOrdinal = 0;
   private _timers = new Set<NodeJS.Timeout>();
   private _context: BrowserContext;
-  private _resumeCallback: (() => void) | null = null;
   private _mode: Mode;
-  private _paused = false;
   private _output: OutputMultiplexer;
   private _bufferedOutput: BufferedOutput;
   private _recorderApp: RecorderApp | null = null;
-  private _highlighterType: string;
   private _params: channels.BrowserContextRecorderSupplementEnableParams;
+  private _currentCallsMetadata = new Map<CallMetadata, SdkObject>();
+  private _pausedCallsMetadata = new Map<CallMetadata, () => void>();
+  private _pauseOnNextStatement = true;
+  private _recorderSource: Source;
+  private _userSources = new Map<string, Source>();
 
-  static getOrCreate(context: BrowserContext, params: channels.BrowserContextRecorderSupplementEnableParams): Promise<RecorderSupplement> {
+  static getOrCreate(context: BrowserContext, params: channels.BrowserContextRecorderSupplementEnableParams = {}): Promise<RecorderSupplement> {
     let recorderPromise = (context as any)[symbol] as Promise<RecorderSupplement>;
     if (!recorderPromise) {
       const recorder = new RecorderSupplement(context, params);
@@ -61,33 +67,33 @@ export class RecorderSupplement {
     return recorderPromise;
   }
 
+  static getNoCreate(context: BrowserContext): Promise<RecorderSupplement> | undefined {
+    return (context as any)[symbol] as Promise<RecorderSupplement> | undefined;
+  }
+
   constructor(context: BrowserContext, params: channels.BrowserContextRecorderSupplementEnableParams) {
     this._context = context;
     this._params = params;
     this._mode = params.startRecording ? 'recording' : 'none';
     let languageGenerator: LanguageGenerator;
-    switch (params.language) {
+    let language = params.language || context._options.sdkLanguage;
+    switch (language) {
       case 'javascript': languageGenerator = new JavaScriptLanguageGenerator(); break;
       case 'csharp': languageGenerator = new CSharpLanguageGenerator(); break;
       case 'python':
       case 'python-async': languageGenerator = new PythonLanguageGenerator(params.language === 'python-async'); break;
       default: throw new Error(`Invalid target: '${params.language}'`);
     }
-    let highlighterType = params.language;
-    if (highlighterType === 'python-async')
-      highlighterType = 'python';
+    if (language === 'python-async')
+      language = 'python';
 
-    const writable: Writable = {
-      write: (text: string) => context.emit(BrowserContext.Events.StdOut, text),
-      columns: () => context.terminalSize.columns || 80
-    };
-    const outputs: RecorderOutput[] = [params.terminal ? new TerminalOutput(writable, highlighterType) : new FlushingTerminalOutput(writable)];
-    this._highlighterType = highlighterType;
+    this._recorderSource = { file: '<recorder>', text: '', language, highlight: [] };
     this._bufferedOutput = new BufferedOutput(async text => {
-      if (this._recorderApp)
-        this._recorderApp.setSource(text, highlighterType);
+      this._recorderSource.text = text;
+      this._recorderSource.revealLine = text.split('\n').length - 1;
+      this._pushAllSources();
     });
-    outputs.push(this._bufferedOutput);
+    const outputs: RecorderOutput[] = [ this._bufferedOutput ];
     if (params.outputFile)
       outputs.push(new FileOutput(params.outputFile));
     this._output = new OutputMultiplexer(outputs);
@@ -99,7 +105,7 @@ export class RecorderSupplement {
   }
 
   async install() {
-    const recorderApp = await RecorderApp.open();
+    const recorderApp = await RecorderApp.open(this._context);
     this._recorderApp = recorderApp;
     recorderApp.once('close', () => {
       this._recorderApp = null;
@@ -113,8 +119,16 @@ export class RecorderSupplement {
           this._context.pages()[0].bringToFront().catch(() => {});
         return;
       }
+      if (data.event === 'step') {
+        this._resume(true);
+        return;
+      }
       if (data.event === 'resume') {
-        this._resume();
+        this._resume(false);
+        return;
+      }
+      if (data.event === 'pause') {
+        this._pauseOnNextStatement = true;
         return;
       }
       if (data.event === 'clear') {
@@ -125,8 +139,8 @@ export class RecorderSupplement {
 
     await Promise.all([
       recorderApp.setMode(this._mode),
-      recorderApp.setPaused(this._paused),
-      recorderApp.setSource(this._bufferedOutput.buffer(), this._highlighterType)
+      recorderApp.setPaused(!!this._pausedCallsMetadata.size),
+      this._pushAllSources()
     ]);
 
     this._context.on(BrowserContext.Events.Page, page => this._onPage(page));
@@ -153,37 +167,49 @@ export class RecorderSupplement {
     await this._context.exposeBinding('_playwrightRecorderCommitAction', false,
         (source: BindingSource, action: actions.Action) => this._generator.commitLastAction());
 
-    await this._context.exposeBinding('_playwrightRecorderPrintSelector', false, (_, text) => {
-      this._context.emit(BrowserContext.Events.StdOut, `Selector: \x1b[38;5;130m${text}\x1b[0m\n`);
-    });
-
-    await this._context.exposeBinding('_playwrightRecorderState', false, () => {
-      return { mode: this._mode };
+    await this._context.exposeBinding('_playwrightRecorderState', false, source => {
+      let actionPoint: Point | undefined = undefined;
+      let actionSelector: string | undefined = undefined;
+      for (const [metadata, sdkObject] of this._currentCallsMetadata) {
+        if (source.page === sdkObject.attribution.page) {
+          actionPoint = metadata.point || actionPoint;
+          actionSelector = metadata.params.selector || actionSelector;
+        }
+      }
+      const uiState: UIState = { mode: this._mode, actionPoint, actionSelector };
+      return uiState;
     });
 
     await this._context.exposeBinding('_playwrightResume', false, () => {
-      this._resume().catch(() => {});
+      this._resume(false).catch(() => {});
     });
 
-    await this._context.extendInjectedScript(recorderSource.source);
+    await this._context.extendInjectedScript(recorderSource.source, { isUnderTest: isUnderTest() });
     await this._context.extendInjectedScript(consoleApiSource.source);
 
     (this._context as any).recorderAppForTest = recorderApp;
   }
 
-  async pause() {
-    this._paused = true;
+  async pause(metadata: CallMetadata) {
+    const result = new Promise<void>(f => {
+      this._pausedCallsMetadata.set(metadata, f);
+    });
     this._recorderApp!.setPaused(true);
-    return new Promise<void>(f => this._resumeCallback = f);
+    this._updateUserSources();
+    this.updateCallLog([metadata]);
+    return result;
   }
 
-  private async _resume() {
-    if (this._resumeCallback)
-      this._resumeCallback();
-    this._resumeCallback = null;
-    this._paused = false;
-    if (this._recorderApp)
-      this._recorderApp.setPaused(this._paused);
+  private async _resume(step: boolean) {
+    this._pauseOnNextStatement = step;
+
+    for (const callback of this._pausedCallsMetadata.values())
+      callback();
+    this._pausedCallsMetadata.clear();
+
+    this._recorderApp?.setPaused(false);
+    this._updateUserSources();
+    this.updateCallLog([...this._currentCallsMetadata.keys()]);
   }
 
   private async _onPage(page: Page) {
@@ -238,30 +264,30 @@ export class RecorderSupplement {
 
   private async _performAction(frame: Frame, action: actions.Action) {
     const page = frame._page;
-    const controller = new ProgressController();
     const actionInContext: ActionInContext = {
       pageAlias: this._pageAliases.get(page)!,
       ...describeFrame(frame),
       action
     };
     this._generator.willPerformAction(actionInContext);
+    const noCallMetadata = internalCallMetadata();
     try {
       const kActionTimeout = 5000;
       if (action.name === 'click') {
         const { options } = toClickOptions(action);
-        await frame.click(controller, action.selector, { ...options, timeout: kActionTimeout });
+        await frame.click(noCallMetadata, action.selector, { ...options, timeout: kActionTimeout });
       }
       if (action.name === 'press') {
         const modifiers = toModifiers(action.modifiers);
         const shortcut = [...modifiers, action.key].join('+');
-        await frame.press(controller, action.selector, shortcut, { timeout: kActionTimeout });
+        await frame.press(noCallMetadata, action.selector, shortcut, { timeout: kActionTimeout });
       }
       if (action.name === 'check')
-        await frame.check(controller, action.selector, { timeout: kActionTimeout });
+        await frame.check(noCallMetadata, action.selector, { timeout: kActionTimeout });
       if (action.name === 'uncheck')
-        await frame.uncheck(controller, action.selector, { timeout: kActionTimeout });
+        await frame.uncheck(noCallMetadata, action.selector, { timeout: kActionTimeout });
       if (action.name === 'select')
-        await frame.selectOption(controller, action.selector, [], action.options.map(value => ({ value })), { timeout: kActionTimeout });
+        await frame.selectOption(noCallMetadata, action.selector, [], action.options.map(value => ({ value })), { timeout: kActionTimeout });
     } catch (e) {
       this._generator.performedActionFailed(actionInContext);
       return;
@@ -301,4 +327,100 @@ export class RecorderSupplement {
     const pageAlias = this._pageAliases.get(page)!;
     this._generator.signal(pageAlias, page.mainFrame(), { name: 'dialog', dialogAlias: String(++this._lastDialogOrdinal) });
   }
+
+  async onBeforeCall(sdkObject: SdkObject, metadata: CallMetadata): Promise<void> {
+    if (this._mode === 'recording')
+      return;
+    this._currentCallsMetadata.set(metadata, sdkObject);
+    this._updateUserSources();
+    this.updateCallLog([metadata]);
+    if (metadata.method === 'pause' || (this._pauseOnNextStatement && metadata.method === 'goto'))
+      await this.pause(metadata);
+  }
+
+  async onAfterCall(metadata: CallMetadata): Promise<void> {
+    if (this._mode === 'recording')
+      return;
+    if (!metadata.error)
+      this._currentCallsMetadata.delete(metadata);
+    this._pausedCallsMetadata.delete(metadata);
+    this._updateUserSources();
+    this.updateCallLog([metadata]);
+  }
+
+  private _updateUserSources() {
+    // Remove old decorations.
+    for (const source of this._userSources.values()) {
+      source.highlight = [];
+      source.revealLine = undefined;
+    }
+
+    // Apply new decorations.
+    for (const metadata of this._currentCallsMetadata.keys()) {
+      if (!metadata.stack || !metadata.stack[0])
+        continue;
+      const { file, line } = metadata.stack[0];
+      let source = this._userSources.get(file);
+      if (!source) {
+        source = { file, text: this._readSource(file), highlight: [], language: languageForFile(file) };
+        this._userSources.set(file, source);
+      }
+      if (line) {
+        const paused = this._pausedCallsMetadata.has(metadata);
+        source.highlight.push({ line, type: metadata.error ? 'error' : (paused ? 'paused' : 'running') });
+        if (paused)
+          source.revealLine = line;
+      }
+    }
+    this._pushAllSources();
+  }
+
+  private _pushAllSources() {
+    this._recorderApp?.setSources([this._recorderSource, ...this._userSources.values()]);
+  }
+
+  async onBeforeInputAction(metadata: CallMetadata): Promise<void> {
+    if (this._mode === 'recording')
+      return;
+    if (this._pauseOnNextStatement)
+      await this.pause(metadata);
+  }
+
+  async updateCallLog(metadatas: CallMetadata[]): Promise<void> {
+    if (this._mode === 'recording')
+      return;
+    const logs: CallLog[] = [];
+    for (const metadata of metadatas) {
+      if (!metadata.method)
+        continue;
+      const title = metadata.method;
+      let status: 'done' | 'in-progress' | 'paused' | 'error' = 'done';
+      if (this._currentCallsMetadata.has(metadata))
+        status = 'in-progress';
+      if (this._pausedCallsMetadata.has(metadata))
+        status = 'paused';
+      if (metadata.error)
+        status = 'error';
+      logs.push({ id: metadata.id, messages: metadata.log, title, status, error: metadata.error });
+    }
+    this._recorderApp?.updateCallLogs(logs);
+  }
+
+  private _readSource(fileName: string): string {
+    try {
+      return fs.readFileSync(fileName, 'utf-8');
+    } catch (e) {
+      return '// No source available';
+    }
+  }
+}
+
+function languageForFile(file: string) {
+  if (file.endsWith('.py'))
+    return 'python';
+  if (file.endsWith('.java'))
+    return 'java';
+  if (file.endsWith('.cs'))
+    return 'csharp';
+  return 'javascript';
 }

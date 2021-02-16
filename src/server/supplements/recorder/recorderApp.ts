@@ -14,41 +14,40 @@
  * limitations under the License.
  */
 
-import * as os from 'os';
-import * as fs from 'fs';
-import * as path from 'path';
+import fs from 'fs';
+import path from 'path';
 import * as util from 'util';
 import { CRPage } from '../../chromium/crPage';
 import { Page } from '../../page';
 import { ProgressController } from '../../progress';
 import { createPlaywright } from '../../playwright';
 import { EventEmitter } from 'events';
-import { DEFAULT_ARGS } from '../../chromium/chromium';
+import { internalCallMetadata } from '../../instrumentation';
+import type { CallLog, EventData, Mode, Source } from './recorderTypes';
+import { BrowserContext } from '../../browserContext';
+import { isUnderTest } from '../../../utils/utils';
 
 const readFileAsync = util.promisify(fs.readFile);
-
-export type Mode = 'inspecting' | 'recording' | 'none';
-export type EventData = {
-  event: 'clear' | 'resume' | 'setMode',
-  params: any
-};
 
 declare global {
   interface Window {
     playwrightSetMode: (mode: Mode) => void;
     playwrightSetPaused: (paused: boolean) => void;
-    playwrightSetSource: (params: { text: string, language: string }) => void;
+    playwrightSetSources: (sources: Source[]) => void;
+    playwrightUpdateLogs: (callLogs: CallLog[]) => void;
     dispatch(data: EventData): Promise<void>;
   }
 }
 
 export class RecorderApp extends EventEmitter {
   private _page: Page;
+  readonly wsEndpoint: string | undefined;
 
-  constructor(page: Page) {
+  constructor(page: Page, wsEndpoint: string | undefined) {
     super();
     this.setMaxListeners(0);
     this._page = page;
+    this.wsEndpoint = wsEndpoint;
   }
 
   async close() {
@@ -87,30 +86,33 @@ export class RecorderApp extends EventEmitter {
       this._page.context().close().catch(e => console.error(e));
     });
 
-    await this._page.mainFrame().goto(new ProgressController(), 'https://playwright/index.html');
+    const mainFrame = this._page.mainFrame();
+    await mainFrame.goto(internalCallMetadata(), 'https://playwright/index.html');
   }
 
-  static async open(): Promise<RecorderApp> {
+  static async open(inspectedContext: BrowserContext): Promise<RecorderApp> {
     const recorderPlaywright = createPlaywright(true);
-    const context = await recorderPlaywright.chromium.launchPersistentContext('', {
-      ignoreAllDefaultArgs: true,
-      args: [
-        ...DEFAULT_ARGS,
-        `--user-data-dir=${path.join(os.homedir(),'.playwright-app')}`,
-        '--remote-debugging-pipe',
-        '--app=data:text/html,',
-        `--window-size=300,800`,
-      ],
-      noDefaultViewport: true
+    const args = [
+      '--app=data:text/html,',
+      '--window-size=600,600',
+      '--window-position=1280,10',
+    ];
+    if (isUnderTest())
+      args.push(`--remote-debugging-port=0`);
+    const context = await recorderPlaywright.chromium.launchPersistentContext(internalCallMetadata(), '', {
+      sdkLanguage: inspectedContext._options.sdkLanguage,
+      args,
+      noDefaultViewport: true,
+      headless: !!process.env.PWCLI_HEADLESS_FOR_TEST || (isUnderTest() && !inspectedContext._browser.options.headful),
+      useWebSocket: isUnderTest()
     });
-
-    const controller = new ProgressController();
+    const controller = new ProgressController(internalCallMetadata(), context._browser);
     await controller.run(async progress => {
       await context._browser._defaultContext!._loadDefaultContextAsIs(progress);
     });
 
     const [page] = context.pages();
-    const result = new RecorderApp(page);
+    const result = new RecorderApp(page, context._browser.options.wsEndpoint);
     await result._init();
     return result;
   }
@@ -127,10 +129,25 @@ export class RecorderApp extends EventEmitter {
     }).toString(), true, paused, 'main').catch(() => {});
   }
 
-  async setSource(text: string, language: string): Promise<void> {
-    await this._page.mainFrame()._evaluateExpression(((param: { text: string, language: string }) => {
-      window.playwrightSetSource(param);
-    }).toString(), true, { text, language }, 'main').catch(() => {});
+  async setSources(sources: Source[]): Promise<void> {
+    await this._page.mainFrame()._evaluateExpression(((sources: Source[]) => {
+      window.playwrightSetSources(sources);
+    }).toString(), true, sources, 'main').catch(() => {});
+
+    // Testing harness for runCLI mode.
+    {
+      if (process.env.PWCLI_EXIT_FOR_TEST) {
+        process.stdout.write('\n-------------8<-------------\n');
+        process.stdout.write(sources[0].text);
+        process.stdout.write('\n-------------8<-------------\n');
+      }
+    }
+  }
+
+  async updateCallLogs(callLogs: CallLog[]): Promise<void> {
+    await this._page.mainFrame()._evaluateExpression(((callLogs: CallLog[]) => {
+      window.playwrightUpdateLogs(callLogs);
+    }).toString(), true, callLogs, 'main').catch(() => {});
   }
 
   async bringToFront() {

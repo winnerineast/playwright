@@ -236,6 +236,10 @@ Emitted when the JavaScript [`load`](https://developer.mozilla.org/en-US/docs/We
 
 Emitted when an uncaught exception happens within the page.
 
+## event: Page.pageError
+* langs: csharp, java
+- type: <[string]>
+
 ## event: Page.popup
 - type: <[Page]>
 
@@ -353,12 +357,19 @@ The order of evaluation of multiple scripts installed via [`method: BrowserConte
 :::
 
 ### param: Page.addInitScript.script
+* langs: js
 - `script` <[function]|[string]|[Object]>
   - `path` <[path]> Path to the JavaScript file. If `path` is a relative path, then it is resolved relative to the
     current working directory. Optional.
   - `content` <[string]> Raw script content. Optional.
 
 Script to be evaluated in the page.
+
+### param: Page.addInitScript.script
+* langs: csharp, java
+- `script` <[string]|[path]>
+
+Script to be evaluated in all pages in the browser context.
 
 ### param: Page.addInitScript.arg
 * langs: js
@@ -712,13 +723,13 @@ page.evaluate("matchMedia('(prefers-color-scheme: no-preference)').matches")
 ```
 
 ### option: Page.emulateMedia.media
-- `media` <null|[MediaEnum]<"screen"|"print">>
+- `media` <null|[Media]<"screen"|"print">>
 
 Changes the CSS media type of the page. The only allowed values are `'screen'`, `'print'` and `null`.
 Passing `null` disables CSS media emulation.
 
 ### option: Page.emulateMedia.colorScheme
-- `colorScheme` <null|[ColorSchemeEnum]<"light"|"dark"|"no-preference">>
+- `colorScheme` <null|[ColorScheme]<"light"|"dark"|"no-preference">>
 
 Emulates `'prefers-colors-scheme'` media feature, supported values are `'light'`, `'dark'`, `'no-preference'`. Passing
 `null` disables color scheme emulation.
@@ -1263,13 +1274,31 @@ frame = page.frame(url=r".*domain.*")
 ```
 
 ### param: Page.frame.frameSelector
-* langs: java, js
+* langs: js
 - `frameSelector` <[string]|[Object]>
   - `name` <[string]> Frame name specified in the `iframe`'s `name` attribute. Optional.
   - `url` <[string]|[RegExp]|[function]\([URL]\):[boolean]> A glob pattern, regex pattern or predicate receiving
     frame's `url` as a [URL] object. Optional.
 
 Frame name or other frame lookup options.
+
+### param: Page.frame.name
+* langs: csharp, java
+- `name` <[string]>
+
+Frame name specified in the `iframe`'s `name` attribute.
+
+## method: Page.frameByUrl
+* langs: csharp, java
+- returns: <[null]|[Frame]>
+
+Returns frame with matching URL.
+
+### param: Page.frameByUrl.url
+* langs: csharp, java
+- `url` <[string]|[RegExp]|[function]\([URL]\):[boolean]>
+
+A glob pattern, regex pattern or predicate receiving frame's `url` as a [URL] object.
 
 ## method: Page.frames
 - returns: <[Array]<[Frame]>>
@@ -1448,7 +1477,7 @@ Returns whether the element is [enabled](./actionability.md#enabled).
 ## async method: Page.isHidden
 - returns: <[boolean]>
 
-Returns whether the element is hidden, the opposite of [visible](./actionability.md#visible).
+Returns whether the element is hidden, the opposite of [visible](./actionability.md#visible).  [`option: selector`] that does not match any elements is considered hidden.
 
 ### param: Page.isHidden.selector = %%-input-selector-%%
 
@@ -1457,7 +1486,7 @@ Returns whether the element is hidden, the opposite of [visible](./actionability
 ## async method: Page.isVisible
 - returns: <[boolean]>
 
-Returns whether the element is [visible](./actionability.md#visible).
+Returns whether the element is [visible](./actionability.md#visible). [`option: selector`] that does not match any elements is considered not visible.
 
 ### param: Page.isVisible.selector = %%-input-selector-%%
 
@@ -1488,7 +1517,7 @@ User can inspect selectors or perform manual steps while paused. Resume will con
 the place it was paused.
 
 :::note
-This method requires Playwright to be started in a headed mode, with a falsy [`options: headless`] value in
+This method requires Playwright to be started in a headed mode, with a falsy [`option: headless`] value in
 the [`method: BrowserType.launch`].
 :::
 
@@ -1613,21 +1642,46 @@ Paper ranges to print, e.g., '1-5, 8, 11-13'. Defaults to the empty string, whic
 Paper format. If set, takes priority over [`option: width`] or [`option: height`] options. Defaults to 'Letter'.
 
 ### option: Page.pdf.width
+* langs: js, python
 - `width` <[string]|[float]>
 
 Paper width, accepts values labeled with units.
 
+### option: Page.pdf.width
+* langs: csharp, java
+- `width` <[string]>
+
+Paper width, accepts values labeled with units.
+
 ### option: Page.pdf.height
+* langs: js, python
 - `height` <[string]|[float]>
 
 Paper height, accepts values labeled with units.
 
+### option: Page.pdf.height
+* langs: csharp, java
+- `height` <[string]>
+
+Paper height, accepts values labeled with units.
+
 ### option: Page.pdf.margin
+* langs: js, python
 - `margin` <[Object]>
   - `top` <[string]|[float]> Top margin, accepts values labeled with units. Defaults to `0`.
   - `right` <[string]|[float]> Right margin, accepts values labeled with units. Defaults to `0`.
   - `bottom` <[string]|[float]> Bottom margin, accepts values labeled with units. Defaults to `0`.
   - `left` <[string]|[float]> Left margin, accepts values labeled with units. Defaults to `0`.
+
+Paper margins, defaults to none.
+
+### option: Page.pdf.margin
+* langs: csharp, java
+- `margin` <[Object]>
+  - `top` <[string]> Top margin, accepts values labeled with units. Defaults to `0`.
+  - `right` <[string]> Right margin, accepts values labeled with units. Defaults to `0`.
+  - `bottom` <[string]> Bottom margin, accepts values labeled with units. Defaults to `0`.
+  - `left` <[string]> Left margin, accepts values labeled with units. Defaults to `0`.
 
 Paper margins, defaults to none.
 
@@ -2202,7 +2256,7 @@ Performs action and waits for a [ConoleMessage] to be logged by in the page. If 
 Will throw an error if the page is closed before the console event is fired.
 
 ### option: Page.waitForConsoleMessage.predicate =
-- `predicate` <[function]\([ConsoleMessage]\):[bool]>
+- `predicate` <[function]\([ConsoleMessage]\):[boolean]>
 
 Receives the [ConsoleMessage] object and resolves to truthy value when the waiting should resolve.
 
@@ -2218,7 +2272,7 @@ Performs action and waits for a new [Download]. If predicate is provided, it pas
 Will throw an error if the page is closed before the download event is fired.
 
 ### option: Page.waitForDownload.predicate =
-- `predicate` <[function]\([Download]\):[bool]>
+- `predicate` <[function]\([Download]\):[boolean]>
 
 Receives the [Download] object and resolves to truthy value when the waiting should resolve.
 
@@ -2272,7 +2326,7 @@ Performs action and waits for a new [FileChooser] to be created. If predicate is
 Will throw an error if the page is closed before the file chooser is opened.
 
 ### option: Page.waitForFileChooser.predicate =
-- `predicate` <[function]\([FileChooser]\):[bool]>
+- `predicate` <[function]\([FileChooser]\):[boolean]>
 
 Receives the [FileChooser] object and resolves to truthy value when the waiting should resolve.
 
@@ -2476,7 +2530,7 @@ Performs action and waits for a popup [Page]. If predicate is provided, it passe
 Will throw an error if the page is closed before the popup event is fired.
 
 ### option: Page.waitForPopup.predicate =
-- `predicate` <[function]\([Page]\):[bool]>
+- `predicate` <[function]\([Page]\):[boolean]>
 
 Receives the [Page] object and resolves to truthy value when the waiting should resolve.
 
@@ -2675,7 +2729,7 @@ Performs action and waits for a new [WebSocket]. If predicate is provided, it pa
 Will throw an error if the page is closed before the WebSocket event is fired.
 
 ### option: Page.waitForWebSocket.predicate =
-- `predicate` <[function]\([WebSocket]\):[bool]>
+- `predicate` <[function]\([WebSocket]\):[boolean]>
 
 Receives the [WebSocket] object and resolves to truthy value when the waiting should resolve.
 
@@ -2691,7 +2745,7 @@ Performs action and waits for a new [Worker]. If predicate is provided, it passe
 Will throw an error if the page is closed before the worker event is fired.
 
 ### option: Page.waitForWorker.predicate =
-- `predicate` <[function]\([Worker]\):[bool]>
+- `predicate` <[function]\([Worker]\):[boolean]>
 
 Receives the [Worker] object and resolves to truthy value when the waiting should resolve.
 
